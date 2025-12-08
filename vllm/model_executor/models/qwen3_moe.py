@@ -123,6 +123,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        top_k: int | None = None,
     ):
         super().__init__()
 
@@ -160,9 +161,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
+        # Use provided top_k or default from config
+        if top_k is None:
+            top_k = config.num_experts_per_tok
+
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
-            top_k=config.num_experts_per_tok,
+            top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=True,
@@ -350,8 +355,18 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if (layer_idx not in mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
+            # Compute dynamic expert count: use more experts in first/last 1/8 of layers
+            num_layers = config.num_hidden_layers
+            use_more_experts = layer_idx < num_layers // 8 or layer_idx >= 7 * num_layers // 8
+            if use_more_experts:
+                top_k = config.num_experts_per_tok
+            else:
+                top_k = max(4, int(0.75 * config.num_experts_per_tok))
+            
+            logger.info(f"Layer {layer_idx}: using {top_k} experts (out of {config.num_experts})")
+            
             self.mlp = Qwen3MoeSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+                vllm_config=vllm_config, prefix=f"{prefix}.mlp", top_k=top_k
             )
         else:
             self.mlp = Qwen3MoeMLP(
