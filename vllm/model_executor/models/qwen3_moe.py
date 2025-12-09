@@ -165,6 +165,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if top_k is None:
             top_k = config.num_experts_per_tok
 
+        # Store top_k for later use in forward (for scaling)
+        self.top_k = top_k
+
+        # Define scaling factors based on number of active experts
+        # You can customize these values based on your experiments
+        self.expert_scaling_factors = {
+            # 4: 0.95,
+            4: 0.95,
+            6: 0.97,
+            8: 1.0,  # default, no scaling
+        }
+
+        logger.info(f"Top_k: {top_k}, scaling factor: {self.expert_scaling_factors.get(top_k, 1.0)}")  
+
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
             top_k=top_k,
@@ -210,6 +224,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
+
+        # Apply scaling factor based on number of active experts
+        scaling_factor = self.expert_scaling_factors.get(self.top_k, 1.0)
+        if scaling_factor != 1.0:
+            final_hidden_states = final_hidden_states * scaling_factor
 
         # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
@@ -356,14 +375,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             # Compute dynamic expert count: use more experts in first/last 1/8 of layers
-            num_layers = config.num_hidden_layers
-            use_more_experts = layer_idx < num_layers // 8 or layer_idx >= 7 * num_layers // 8
+            # num_layers = config.num_hidden_layers
+            # use_more_experts = layer_idx < num_layers // 8 or layer_idx >= 7 * num_layers // 8
+            use_more_experts = layer_idx % 2 == 1
             if use_more_experts:
                 top_k = config.num_experts_per_tok
             else:
-                top_k = max(4, int(0.75 * config.num_experts_per_tok))
+                top_k = max(4, int(0.5 * config.num_experts_per_tok))
             
-            logger.info(f"Layer {layer_idx}: using {top_k} experts (out of {config.num_experts})")
+            logger.info(f"Layer {layer_idx}")
+            # logger.info(f"Layer {layer_idx}: using {top_k} experts (out of {config.num_experts})")
             
             self.mlp = Qwen3MoeSparseMoeBlock(
                 vllm_config=vllm_config, prefix=f"{prefix}.mlp", top_k=top_k
